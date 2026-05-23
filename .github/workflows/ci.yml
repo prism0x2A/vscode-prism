@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Package (verify vsix builds)
+        run: npx @vscode/vsce package --no-dependencies
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-prism-dev.vsix
+          path: "*.vsix"
+          retention-days: 7

@@ -1,0 +1,70 @@
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      pre_release:
+        description: "Publish as pre-release"
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    name: Package & Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Package extension
+        run: npx @vscode/vsce package --no-dependencies
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-prism-${{ github.ref_name }}.vsix
+          path: "*.vsix"
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ !inputs.pre_release }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce publish --no-dependencies --pat "$VSCE_PAT"
+
+      - name: Publish as pre-release
+        if: ${{ inputs.pre_release }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce publish --no-dependencies --pre-release --pat "$VSCE_PAT"
+
+      - name: Publish to Open VSX (Gitpod / VSCodium)
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish --no-dependencies *.vsix -p "$OVSX_PAT"
+        continue-on-error: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.vsix"
+          generate_release_notes: true
+          prerelease: ${{ inputs.pre_release || false }}
