@@ -1,0 +1,122 @@
+{
+  "name": "vscode-prism",
+  "displayName": "PRISM — Architecture Intelligence",
+  "description": "Inline AMBER capability tags, drift warnings, and Architecture Coherence Score directly in VS Code.",
+  "version": "0.1.0",
+  "publisher": "prism0x2a",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/prism0x2A/vscode-prism"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "architecture",
+    "amber",
+    "code-quality",
+    "prism",
+    "drift",
+    "capabilities"
+  ],
+  "activationEvents": [
+    "workspaceContains:.amber/capabilities.md",
+    "workspaceContains:.prism/config.json"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "prism.openDashboard",
+        "title": "PRISM: Open Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "prism.runScan",
+        "title": "PRISM: Run AMBER Scan"
+      },
+      {
+        "command": "prism.tagFile",
+        "title": "PRISM: Tag This File with Capability"
+      },
+      {
+        "command": "prism.showCapabilities",
+        "title": "PRISM: Show All Capabilities"
+      },
+      {
+        "command": "prism.showCoherenceScore",
+        "title": "PRISM: Show Coherence Score"
+      },
+      {
+        "command": "prism.healDrift",
+        "title": "PRISM: Auto-heal Drift in This File"
+      }
+    ],
+    "configuration": {
+      "title": "PRISM",
+      "properties": {
+        "prism.dashboardUrl": {
+          "type": "string",
+          "default": "http://localhost:3000",
+          "description": "URL of the PRISM dashboard (prism0x2A). Used to open dashboard links and call APIs."
+        },
+        "prism.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the PRISM coherence score in the status bar."
+        },
+        "prism.showDriftDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline warnings for files with AMBER documentation drift."
+        },
+        "prism.showCapabilityLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show CodeLens annotations showing which capability a file belongs to."
+        },
+        "prism.autoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically refresh PRISM data when files change."
+        }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "prism.tagFile",
+          "group": "prism@1",
+          "when": "resourceExtname =~ /\\.(ts|tsx|js|jsx|py|go|rs)$/"
+        },
+        {
+          "command": "prism.healDrift",
+          "group": "prism@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "dev": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "prismlens": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}
