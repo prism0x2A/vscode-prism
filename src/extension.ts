@@ -37,8 +37,9 @@ interface Registry {
   lifecycle?: string;
 }
 
+interface CoherenceHistoryEntry { score: number; grade: string; computedAt: string; target?: string }
 interface CoherenceHistory {
-  entries: Array<{ score: number; grade: string; computedAt: string }>;
+  entries: Array<CoherenceHistoryEntry>;
   latest: { score: number; grade: string; label: string } | null;
 }
 
@@ -123,9 +124,53 @@ function loadData(root: string): void {
   ) ?? safeReadJson<Registry[]>(
     path.join(root, ".amber", "registry.json")
   ) ?? [];
+
+  // Fallback: workspaces that keep their registry as .amber/capabilities.md
+  // (the source of truth in prism) don't have a JSON sidecar. Synthesize
+  // minimal Registry entries from the capability IDs referenced in state.json
+  // so the sidebar tree, code lenses, and capability picker still work
+  // without round-tripping through prism Studio.
+  if (registry.length === 0 && state) {
+    const ids = new Set<string>();
+    for (const entry of Object.values(state.files)) {
+      for (const cid of entry.capabilities) ids.add(cid);
+    }
+    registry = Array.from(ids).map((id) => ({ id, name: id }));
+  }
+  // Coherence history lives in three possible spots, in order of preference:
+  //   1. .prism/green/coherence-history.json (in-repo, legacy)
+  //   2. ~/.prism0x2a/.prism/green/workspaces/<key>/coherence-history.json
+  //   3. ~/.prism0x2a/.prism/green/coherence-history.json (global default)
+  // Studio writes #2 or #3 — the entries carry a `target` field, so we filter
+  // by the workspace root to get the score for THIS folder.
   history = safeReadJson<CoherenceHistory>(
     path.join(root, ".prism", "green", "coherence-history.json")
   );
+  if (!history || (history.entries ?? []).length === 0) {
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+    const candidates = [
+      path.join(home, ".prism0x2a", ".prism", "green", "coherence-history.json"),
+    ];
+    // Also probe per-workspace dirs (key is opaque; loop over them all).
+    const wsDir = path.join(home, ".prism0x2a", ".prism", "green", "workspaces");
+    try {
+      for (const sub of fs.readdirSync(wsDir)) {
+        candidates.push(path.join(wsDir, sub, "coherence-history.json"));
+      }
+    } catch { /* dir not present yet */ }
+    for (const p of candidates) {
+      const raw = safeReadJson<CoherenceHistory>(p);
+      if (!raw?.entries) continue;
+      const ours = raw.entries.filter((e) => !e.target || e.target === root);
+      if (ours.length === 0) continue;
+      const latestEntry = ours[ours.length - 1];
+      history = {
+        entries: ours,
+        latest: { score: latestEntry.score, grade: latestEntry.grade, label: "" },
+      };
+      break;
+    }
+  }
 
   // Build drift file set
   driftFiles.clear();
@@ -615,6 +660,8 @@ class CoherenceWebviewProvider implements vscode.WebviewViewProvider {
     const totalCaps = registry.length;
     const driftCount = driftFiles.size;
     const fileCount = state ? Object.keys(state.files).length : 0;
+    const root = getWorkspaceRoot();
+    const stateExists = root ? fs.existsSync(path.join(root, ".amber", "state.json")) : false;
 
     const score = latest ? (latest as { score: number }).score : null;
     const grade = latest ? (latest as { grade: string }).grade : "—";
@@ -625,30 +672,48 @@ class CoherenceWebviewProvider implements vscode.WebviewViewProvider {
       : grade === "F" ? "#ef4444"
       : "var(--vscode-foreground)";
 
+    // Compact layout: score and grade on one row, stats as a horizontal
+    // strip, workspace info collapsed to one line when healthy. Total
+    // height target ≈ 180px so users don't have to scroll between
+    // Capabilities and Coherence in default sidebar splits.
+    const wsLine = root
+      ? `${escapeHtml(root.replace(process.env.HOME ?? "", "~"))} ${stateExists ? "✓" : "<span class=\"missing\">✗ no scan</span>"}`
+      : "no folder open";
+
     this.view.webview.html = /* html */ `
       <!doctype html><html><head><meta charset="utf-8"/>
       <style>
-        body { font-family: var(--vscode-font-family); padding: 12px; color: var(--vscode-foreground); }
-        .score { font-size: 42px; font-weight: 700; color: ${gradeColor}; line-height: 1; }
-        .grade { font-size: 14px; opacity: 0.7; margin-top: 4px; }
-        .stats { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
-        .stat { display: flex; justify-content: space-between; padding: 6px 8px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; }
-        .stat strong { font-variant-numeric: tabular-nums; }
-        .warn { color: var(--vscode-editorWarning-foreground); }
-        button { width: 100%; padding: 6px 10px; margin-top: 8px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; border-radius: 4px; cursor: pointer; font-family: inherit; }
+        body { font-family: var(--vscode-font-family); padding: 8px 10px; color: var(--vscode-foreground); font-size: 12px; }
+        .head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+        .score { font-size: 28px; font-weight: 700; color: ${gradeColor}; line-height: 1; font-variant-numeric: tabular-nums; }
+        .grade { opacity: 0.7; }
+        .empty { opacity: 0.6; text-align: center; padding: 8px 0; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-bottom: 8px; }
+        .stat { padding: 4px 6px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 3px; text-align: center; }
+        .stat .n { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+        .stat .l { font-size: 10px; opacity: 0.65; text-transform: uppercase; letter-spacing: 0.04em; }
+        .warn .n { color: var(--vscode-editorWarning-foreground); }
+        .ws { font-size: 10px; opacity: 0.7; margin-bottom: 6px; word-break: break-all; font-family: var(--vscode-editor-font-family); }
+        .ws .missing { color: var(--vscode-editorWarning-foreground); }
+        .row { display: flex; gap: 6px; }
+        button { flex: 1; padding: 4px 8px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 11px; }
         button:hover { background: var(--vscode-button-hoverBackground); }
-        .empty { opacity: 0.6; font-size: 12px; text-align: center; padding: 20px 0; }
       </style></head><body>
-        ${score !== null
-          ? `<div class="score">${score}</div><div class="grade">Grade ${grade}</div>`
-          : `<div class="empty">No coherence score yet.<br/>Run an AMBER scan in Studio.</div>`}
-        <div class="stats">
-          <div class="stat"><span>Capabilities</span><strong>${totalCaps}</strong></div>
-          <div class="stat"><span>Tagged files</span><strong>${fileCount}</strong></div>
-          <div class="stat ${driftCount > 0 ? "warn" : ""}"><span>Drifting</span><strong>${driftCount}</strong></div>
+        <div class="head">
+          ${score !== null
+            ? `<span class="score">${score}</span><span class="grade">Grade ${grade}</span>`
+            : `<span class="empty">No score yet — run AMBER scan in Studio</span>`}
         </div>
-        <button onclick="vs.postMessage({type:'open-dashboard'})">Open in Studio</button>
-        <button onclick="vs.postMessage({type:'open-chat'})">Ask PRISM</button>
+        <div class="stats">
+          <div class="stat"><div class="n">${totalCaps}</div><div class="l">Caps</div></div>
+          <div class="stat"><div class="n">${fileCount}</div><div class="l">Tagged</div></div>
+          <div class="stat ${driftCount > 0 ? "warn" : ""}"><div class="n">${driftCount}</div><div class="l">Drift</div></div>
+        </div>
+        <div class="ws" title="${escapeHtml(root ?? "")}">${wsLine}</div>
+        <div class="row">
+          <button onclick="vs.postMessage({type:'open-dashboard'})">Studio</button>
+          <button onclick="vs.postMessage({type:'open-chat'})">Ask PRISM</button>
+        </div>
         <script>const vs = acquireVsCodeApi();</script>
       </body></html>`;
   }
