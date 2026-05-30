@@ -15,6 +15,7 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -448,22 +449,481 @@ async function healDrift(): Promise<void> {
   }
 }
 
+// ─── Open capability for current file ─────────────────────────────────────────
+
+function openCapabilityForCurrentFile(): void {
+  const editor = vscode.window.activeTextEditor;
+  const root = getWorkspaceRoot();
+  if (!editor || !root || !state) {
+    vscode.window.showInformationMessage("PRISM: No AMBER state for this workspace.");
+    return;
+  }
+  const rel = path.relative(root, editor.document.uri.fsPath).replace(/\\/g, "/");
+  const caps = state.files[rel]?.capabilities ?? [];
+  if (caps.length === 0) {
+    vscode.window.showInformationMessage("PRISM: This file isn't tagged with any capability yet.");
+    return;
+  }
+  if (caps.length === 1) {
+    void showCapabilities(caps[0]);
+    return;
+  }
+  void vscode.window.showQuickPick(caps, { placeHolder: "Open which capability?" })
+    .then((pick) => { if (pick) void showCapabilities(pick); });
+}
+
+// ─── Code Actions (💡 quick-fix bulb on drift diagnostics) ────────────────────
+
+class PrismCodeActionProvider implements vscode.CodeActionProvider {
+  static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
+
+  provideCodeActions(
+    document: vscode.TextDocument,
+    _range: vscode.Range | vscode.Selection,
+    context: vscode.CodeActionContext,
+  ): vscode.CodeAction[] {
+    const driftDiags = context.diagnostics.filter(
+      (d) => d.source === "PRISM AMBER" && d.code === "amber-drift",
+    );
+    if (driftDiags.length === 0) return [];
+
+    const actions: vscode.CodeAction[] = [];
+
+    const heal = new vscode.CodeAction(
+      "PRISM: Auto-heal drift (call AI to update @amber-doc)",
+      vscode.CodeActionKind.QuickFix,
+    );
+    heal.command = { command: "prism.healDrift", title: "Heal drift" };
+    heal.diagnostics = driftDiags;
+    heal.isPreferred = true;
+    actions.push(heal);
+
+    const retag = new vscode.CodeAction(
+      "PRISM: Re-tag this file with a different capability",
+      vscode.CodeActionKind.QuickFix,
+    );
+    retag.command = { command: "prism.tagFile", title: "Re-tag" };
+    retag.diagnostics = driftDiags;
+    actions.push(retag);
+
+    const open = new vscode.CodeAction(
+      "PRISM: Open this capability in Studio",
+      vscode.CodeActionKind.QuickFix,
+    );
+    open.command = { command: "prism.openCapability", title: "Open capability" };
+    open.diagnostics = driftDiags;
+    actions.push(open);
+
+    const ask = new vscode.CodeAction(
+      "PRISM: Ask PRISM about this drift",
+      vscode.CodeActionKind.QuickFix,
+    );
+    ask.command = {
+      command: "prism.openChat",
+      title: "Ask PRISM",
+      arguments: [{ seed: `Why is ${path.basename(document.fileName)} drifting from its AMBER doc?` }],
+    };
+    ask.diagnostics = driftDiags;
+    actions.push(ask);
+
+    return actions;
+  }
+}
+
+// ─── Sidebar: Capabilities TreeView ───────────────────────────────────────────
+
+class CapabilityTreeItem extends vscode.TreeItem {
+  constructor(
+    public readonly cap: Registry,
+    public readonly fileCount: number,
+    public readonly hasDrift: boolean,
+  ) {
+    super(cap.name, vscode.TreeItemCollapsibleState.None);
+    this.id = cap.id;
+    this.description = `${fileCount} file${fileCount === 1 ? "" : "s"}${hasDrift ? " ⚠" : ""}`;
+    this.tooltip = `${cap.id}\n${cap.description ?? ""}${cap.criticality ? `\nCriticality: ${cap.criticality}` : ""}`;
+    this.iconPath = new vscode.ThemeIcon(
+      hasDrift ? "warning" : "symbol-namespace",
+      hasDrift ? new vscode.ThemeColor("editorWarning.foreground") : undefined,
+    );
+    this.command = {
+      command: "prism.showCapabilities",
+      title: "Open",
+      arguments: [cap.id],
+    };
+    this.contextValue = "prismCapability";
+  }
+}
+
+class CapabilityTreeProvider implements vscode.TreeDataProvider<CapabilityTreeItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<void>();
+  onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  refresh(): void { this._onDidChangeTreeData.fire(); }
+
+  getTreeItem(item: CapabilityTreeItem): vscode.TreeItem { return item; }
+
+  getChildren(): CapabilityTreeItem[] {
+    if (registry.length === 0) return [];
+    const counts = new Map<string, { files: number; drift: boolean }>();
+    if (state) {
+      for (const [rel, entry] of Object.entries(state.files)) {
+        for (const cid of entry.capabilities) {
+          const c = counts.get(cid) ?? { files: 0, drift: false };
+          c.files += 1;
+          if (entry.drift) c.drift = true;
+          counts.set(cid, c);
+          void rel;
+        }
+      }
+    }
+    return registry
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((cap) => {
+        const c = counts.get(cap.id) ?? { files: 0, drift: false };
+        return new CapabilityTreeItem(cap, c.files, c.drift);
+      });
+  }
+}
+
+// ─── Sidebar: Coherence Webview ───────────────────────────────────────────────
+
+class CoherenceWebviewProvider implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | null = null;
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.onDidReceiveMessage((msg: { type: string }) => {
+      if (msg.type === "open-dashboard") {
+        void vscode.env.openExternal(vscode.Uri.parse(`${dashboardUrl()}/green`));
+      }
+      if (msg.type === "open-chat") {
+        void vscode.commands.executeCommand("prism.openChat");
+      }
+    });
+    this.render();
+  }
+
+  refresh(): void { this.render(); }
+
+  private render(): void {
+    if (!this.view) return;
+    const latest = history?.latest
+      ?? (history?.entries.length ? history.entries[history.entries.length - 1] : null);
+    const totalCaps = registry.length;
+    const driftCount = driftFiles.size;
+    const fileCount = state ? Object.keys(state.files).length : 0;
+
+    const score = latest ? (latest as { score: number }).score : null;
+    const grade = latest ? (latest as { grade: string }).grade : "—";
+    const gradeColor = grade === "A" ? "#10b981"
+      : grade === "B" ? "#84cc16"
+      : grade === "C" ? "#facc15"
+      : grade === "D" ? "#f97316"
+      : grade === "F" ? "#ef4444"
+      : "var(--vscode-foreground)";
+
+    this.view.webview.html = /* html */ `
+      <!doctype html><html><head><meta charset="utf-8"/>
+      <style>
+        body { font-family: var(--vscode-font-family); padding: 12px; color: var(--vscode-foreground); }
+        .score { font-size: 42px; font-weight: 700; color: ${gradeColor}; line-height: 1; }
+        .grade { font-size: 14px; opacity: 0.7; margin-top: 4px; }
+        .stats { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+        .stat { display: flex; justify-content: space-between; padding: 6px 8px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; }
+        .stat strong { font-variant-numeric: tabular-nums; }
+        .warn { color: var(--vscode-editorWarning-foreground); }
+        button { width: 100%; padding: 6px 10px; margin-top: 8px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; border-radius: 4px; cursor: pointer; font-family: inherit; }
+        button:hover { background: var(--vscode-button-hoverBackground); }
+        .empty { opacity: 0.6; font-size: 12px; text-align: center; padding: 20px 0; }
+      </style></head><body>
+        ${score !== null
+          ? `<div class="score">${score}</div><div class="grade">Grade ${grade}</div>`
+          : `<div class="empty">No coherence score yet.<br/>Run an AMBER scan in Studio.</div>`}
+        <div class="stats">
+          <div class="stat"><span>Capabilities</span><strong>${totalCaps}</strong></div>
+          <div class="stat"><span>Tagged files</span><strong>${fileCount}</strong></div>
+          <div class="stat ${driftCount > 0 ? "warn" : ""}"><span>Drifting</span><strong>${driftCount}</strong></div>
+        </div>
+        <button onclick="vs.postMessage({type:'open-dashboard'})">Open in Studio</button>
+        <button onclick="vs.postMessage({type:'open-chat'})">Ask PRISM</button>
+        <script>const vs = acquireVsCodeApi();</script>
+      </body></html>`;
+  }
+}
+
+// ─── Sidebar: Chat Webview ────────────────────────────────────────────────────
+
+interface ChatMessage { role: "user" | "assistant"; text: string }
+const chatHistory: ChatMessage[] = [];
+
+class ChatWebviewProvider implements vscode.WebviewViewProvider {
+  view: vscode.WebviewView | null = null;
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.onDidReceiveMessage(async (msg: { type: string; text?: string }) => {
+      if (msg.type === "send" && msg.text) {
+        await this.handleSend(msg.text);
+      }
+      if (msg.type === "clear") {
+        chatHistory.length = 0;
+        this.render();
+      }
+    });
+    this.render();
+  }
+
+  seed(prompt: string): void {
+    // Pre-fill the input next render — easiest: push as pending user msg via message
+    if (!this.view) return;
+    void this.view.webview.postMessage({ type: "seed", text: prompt });
+  }
+
+  private async handleSend(text: string): Promise<void> {
+    chatHistory.push({ role: "user", text });
+    chatHistory.push({ role: "assistant", text: "…thinking" });
+    this.render();
+
+    const root = getWorkspaceRoot();
+    const editor = vscode.window.activeTextEditor;
+    const relFile = editor && root
+      ? path.relative(root, editor.document.uri.fsPath).replace(/\\/g, "/")
+      : null;
+
+    try {
+      const url = `${dashboardUrl()}/api/amber/ai/chat${root ? `?target=${encodeURIComponent(root)}` : ""}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: text,
+          context: { file: relFile, capabilities: relFile && state ? (state.files[relFile]?.capabilities ?? []) : [] },
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as { reply?: string; suggestion?: { file?: string; newDoc?: string } };
+      chatHistory.pop();
+      chatHistory.push({ role: "assistant", text: data.reply ?? "(no reply)" });
+      this.render();
+
+      if (data.suggestion?.newDoc && relFile) {
+        const apply = await vscode.window.showInformationMessage(
+          `PRISM suggests updating @amber-doc in ${relFile}.`,
+          "Apply", "Dismiss",
+        );
+        if (apply === "Apply" && editor) await applyDocSuggestion(editor, data.suggestion.newDoc);
+      }
+    } catch (err: unknown) {
+      chatHistory.pop();
+      const msg = err instanceof Error ? err.message : String(err);
+      chatHistory.push({
+        role: "assistant",
+        text: `⚠ Could not reach PRISM Studio (${msg}). Make sure it's running, or set \`prism.dashboardUrl\`.`,
+      });
+      this.render();
+    }
+  }
+
+  private render(): void {
+    if (!this.view) return;
+    const bubbles = chatHistory.map((m) => {
+      const bg = m.role === "user"
+        ? "var(--vscode-textBlockQuote-background)"
+        : "var(--vscode-editor-inactiveSelectionBackground)";
+      return `<div class="bubble" style="background:${bg}"><div class="role">${m.role}</div><div class="body">${escapeHtml(m.text)}</div></div>`;
+    }).join("");
+    this.view.webview.html = /* html */ `
+      <!doctype html><html><head><meta charset="utf-8"/>
+      <style>
+        body { font-family: var(--vscode-font-family); padding: 8px; color: var(--vscode-foreground); display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; margin: 0; }
+        #log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-bottom: 8px; }
+        .bubble { padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.45; }
+        .role { font-size: 10px; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+        .body { white-space: pre-wrap; word-break: break-word; }
+        form { display: flex; gap: 6px; border-top: 1px solid var(--vscode-panel-border); padding-top: 8px; }
+        textarea { flex: 1; resize: none; padding: 6px 8px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; font-family: inherit; font-size: 12px; min-height: 48px; }
+        button { padding: 6px 10px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; }
+        button.secondary { background: transparent; color: var(--vscode-foreground); opacity: 0.7; }
+        .empty { opacity: 0.6; font-size: 12px; text-align: center; padding: 30px 10px; }
+      </style></head><body>
+        <div id="log">${bubbles || '<div class="empty">Ask about a file, capability, or drift.<br/>Active file + AMBER context is sent automatically.</div>'}</div>
+        <form id="f">
+          <textarea id="t" placeholder="Ask PRISM…" rows="2"></textarea>
+          <div style="display:flex;flex-direction:column;gap:4px;">
+            <button type="submit">Send</button>
+            <button type="button" class="secondary" onclick="vs.postMessage({type:'clear'})">Clear</button>
+          </div>
+        </form>
+        <script>
+          const vs = acquireVsCodeApi();
+          const f = document.getElementById('f'), t = document.getElementById('t');
+          const log = document.getElementById('log'); log.scrollTop = log.scrollHeight;
+          f.addEventListener('submit', (e) => { e.preventDefault(); const v = t.value.trim(); if (!v) return; vs.postMessage({type:'send', text:v}); t.value=''; });
+          t.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { f.requestSubmit(); } });
+          window.addEventListener('message', (e) => { if (e.data?.type === 'seed') { t.value = e.data.text; t.focus(); } });
+        </script>
+      </body></html>`;
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+
+async function applyDocSuggestion(editor: vscode.TextEditor, newDoc: string): Promise<void> {
+  const text = editor.document.getText();
+  const m = text.match(/@amber-doc\s+([^\n*]+)/);
+  if (!m) {
+    vscode.window.showWarningMessage("PRISM: No @amber-doc tag in this file — can't auto-apply.");
+    return;
+  }
+  const start = editor.document.positionAt(text.indexOf(m[0]));
+  const end = editor.document.positionAt(text.indexOf(m[0]) + m[0].length);
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(editor.document.uri, new vscode.Range(start, end), `@amber-doc ${newDoc}`);
+  await vscode.workspace.applyEdit(edit);
+  await editor.document.save();
+  vscode.window.showInformationMessage("PRISM: @amber-doc updated ✓");
+}
+
+// ─── PR Review Mode ───────────────────────────────────────────────────────────
+
+interface DiffStat { file: string; added: number; removed: number }
+
+function gitDiffNameStat(root: string, base: string): Promise<DiffStat[]> {
+  return new Promise((resolve) => {
+    execFile("git", ["diff", "--numstat", `${base}...HEAD`], { cwd: root, maxBuffer: 5_000_000 }, (err, stdout) => {
+      if (err) { resolve([]); return; }
+      const lines = stdout.split("\n").filter(Boolean);
+      const stats: DiffStat[] = [];
+      for (const line of lines) {
+        const [a, r, f] = line.split("\t");
+        if (!f) continue;
+        stats.push({ file: f, added: Number(a) || 0, removed: Number(r) || 0 });
+      }
+      resolve(stats);
+    });
+  });
+}
+
+function detectBaseBranch(root: string): Promise<string> {
+  return new Promise((resolve) => {
+    execFile("git", ["symbolic-ref", "refs/remotes/origin/HEAD"], { cwd: root }, (err, stdout) => {
+      if (!err && stdout.trim()) { resolve(stdout.trim().replace("refs/remotes/origin/", "origin/")); return; }
+      execFile("git", ["rev-parse", "--verify", "origin/main"], { cwd: root }, (e2) => {
+        resolve(e2 ? "origin/master" : "origin/main");
+      });
+    });
+  });
+}
+
+async function reviewBranch(context: vscode.ExtensionContext): Promise<void> {
+  const root = getWorkspaceRoot();
+  if (!root) { vscode.window.showWarningMessage("PRISM: No workspace open."); return; }
+  const base = await detectBaseBranch(root);
+  const diff = await gitDiffNameStat(root, base);
+  if (diff.length === 0) {
+    vscode.window.showInformationMessage(`PRISM: No changes vs ${base}.`);
+    return;
+  }
+
+  const capImpact = new Map<string, { name: string; files: string[]; drift: boolean }>();
+  const untagged: string[] = [];
+  for (const d of diff) {
+    const caps = state?.files[d.file]?.capabilities ?? [];
+    const drifted = state?.files[d.file]?.drift ?? false;
+    if (caps.length === 0) { untagged.push(d.file); continue; }
+    for (const cid of caps) {
+      const reg = registry.find((r) => r.id === cid);
+      const e = capImpact.get(cid) ?? { name: reg?.name ?? cid, files: [], drift: false };
+      e.files.push(d.file);
+      if (drifted) e.drift = true;
+      capImpact.set(cid, e);
+    }
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    "prism.prReview", `PRISM: Branch Review vs ${base}`,
+    vscode.ViewColumn.Active,
+    { enableScripts: true, retainContextWhenHidden: true },
+  );
+  panel.webview.onDidReceiveMessage((m: { type: string; file?: string; cap?: string }) => {
+    if (m.type === "open-file" && m.file) {
+      void vscode.window.showTextDocument(vscode.Uri.file(path.join(root, m.file)));
+    }
+    if (m.type === "open-cap" && m.cap) {
+      void showCapabilities(m.cap);
+    }
+  });
+
+  const capRows = Array.from(capImpact.entries()).map(([cid, e]) => `
+    <tr>
+      <td><a href="#" onclick="vs.postMessage({type:'open-cap',cap:'${cid}'});return false;">${escapeHtml(e.name)}</a> ${e.drift ? '<span class="warn">⚠ drift</span>' : ""}</td>
+      <td>${e.files.length}</td>
+      <td>${e.files.map((f) => `<a href="#" onclick="vs.postMessage({type:'open-file',file:${JSON.stringify(f)}});return false;">${escapeHtml(path.basename(f))}</a>`).join("<br/>")}</td>
+    </tr>`).join("");
+
+  const untaggedRows = untagged.length === 0 ? "" : `
+    <h3>Untagged files (${untagged.length})</h3>
+    <p class="hint">These touched files aren't in any capability — consider tagging.</p>
+    <ul>${untagged.map((f) => `<li><a href="#" onclick="vs.postMessage({type:'open-file',file:${JSON.stringify(f)}});return false;">${escapeHtml(f)}</a></li>`).join("")}</ul>`;
+
+  panel.webview.html = /* html */ `
+    <!doctype html><html><head><meta charset="utf-8"/>
+    <style>
+      body { font-family: var(--vscode-font-family); padding: 18px 24px; color: var(--vscode-foreground); }
+      h1 { font-size: 18px; margin-bottom: 4px; } h3 { font-size: 14px; margin-top: 24px; }
+      .meta { opacity: 0.7; font-size: 12px; margin-bottom: 18px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+      th { font-weight: 600; opacity: 0.7; }
+      a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .warn { color: var(--vscode-editorWarning-foreground); font-size: 11px; margin-left: 4px; }
+      .hint { opacity: 0.65; font-size: 12px; }
+      .empty { opacity: 0.7; font-style: italic; }
+    </style></head><body>
+      <h1>Branch review</h1>
+      <div class="meta">${diff.length} file${diff.length===1?"":"s"} changed vs <code>${escapeHtml(base)}</code> · ${capImpact.size} capabilit${capImpact.size===1?"y":"ies"} affected</div>
+      <h3>Capability impact</h3>
+      ${capImpact.size === 0
+        ? '<p class="empty">No tagged capabilities touched.</p>'
+        : `<table><thead><tr><th>Capability</th><th>Files</th><th>Touched</th></tr></thead><tbody>${capRows}</tbody></table>`}
+      ${untaggedRows}
+      <script>const vs = acquireVsCodeApi();</script>
+    </body></html>`;
+  context.subscriptions.push(panel);
+}
+
 // ─── Watcher setup ────────────────────────────────────────────────────────────
 
-function setupWatcher(root: string, codeLensProvider: PrismCodeLensProvider): void {
+function setupWatcher(
+  root: string,
+  codeLensProvider: PrismCodeLensProvider,
+  capTree: CapabilityTreeProvider,
+  coherence: CoherenceWebviewProvider,
+): void {
   watcher?.dispose();
   watcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(root, "{.amber/**,.prism/**}")
   );
-  watcher.onDidChange(() => {
+  const onAny = () => {
     loadData(root);
     updateStatusBar();
     codeLensProvider.refresh();
-    // Refresh diagnostics for open editors
+    capTree.refresh();
+    coherence.refresh();
     for (const editor of vscode.window.visibleTextEditors) {
       updateDiagnostics(editor.document);
     }
-  });
+  };
+  watcher.onDidChange(onAny);
+  watcher.onDidCreate(onAny);
+  watcher.onDidDelete(onAny);
 }
 
 // ─── Activation ───────────────────────────────────────────────────────────────
@@ -488,11 +948,30 @@ export function activate(context: vscode.ExtensionContext): void {
     )
   );
 
+  // Quick-fix code actions on AMBER drift diagnostics
+  context.subscriptions.push(
+    vscode.languages.registerCodeActionsProvider(
+      { scheme: "file", pattern: "**/*.{ts,tsx,js,jsx,py,go,rs,java,cs,php,rb,kt,swift,cpp,cbl}" },
+      new PrismCodeActionProvider(),
+      { providedCodeActionKinds: PrismCodeActionProvider.providedCodeActionKinds },
+    ),
+  );
+
+  // Sidebar — capability tree + coherence webview + chat webview
+  const capTree = new CapabilityTreeProvider();
+  const coherence = new CoherenceWebviewProvider();
+  const chat = new ChatWebviewProvider();
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("prism.capabilitiesView", capTree),
+    vscode.window.registerWebviewViewProvider("prism.coherenceView", coherence),
+    vscode.window.registerWebviewViewProvider("prism.chatView", chat),
+  );
+
   // Load initial data
   if (root) {
     loadData(root);
     updateStatusBar();
-    setupWatcher(root, codeLensProvider);
+    setupWatcher(root, codeLensProvider, capTree, coherence);
   }
 
   // Register commands
@@ -502,6 +981,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("prism.tagFile", tagCurrentFile),
     vscode.commands.registerCommand("prism.showCapabilities", showCapabilities),
     vscode.commands.registerCommand("prism.healDrift", healDrift),
+    vscode.commands.registerCommand("prism.openCapability", openCapabilityForCurrentFile),
+    vscode.commands.registerCommand("prism.refreshCapabilities", () => {
+      if (root) loadData(root);
+      capTree.refresh();
+      coherence.refresh();
+      codeLensProvider.refresh();
+      updateStatusBar();
+    }),
+    vscode.commands.registerCommand("prism.openChat", async (arg?: { seed?: string }) => {
+      await vscode.commands.executeCommand("prism.chatView.focus");
+      if (arg?.seed) chat.seed(arg.seed);
+    }),
+    vscode.commands.registerCommand("prism.reviewBranch", () => reviewBranch(context)),
     vscode.commands.registerCommand("prism.runScan", async () => {
       vscode.env.openExternal(vscode.Uri.parse(`${dashboardUrl()}/amber`));
       vscode.window.showInformationMessage("PRISM: Open the dashboard to run a scan.");

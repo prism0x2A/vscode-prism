@@ -55,8 +55,58 @@
       {
         "command": "prism.healDrift",
         "title": "PRISM: Auto-heal Drift in This File"
+      },
+      {
+        "command": "prism.openCapability",
+        "title": "PRISM: Open Capability for This File"
+      },
+      {
+        "command": "prism.openChat",
+        "title": "PRISM: Ask PRISM (Inline Chat)",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "prism.reviewBranch",
+        "title": "PRISM: Review Current Branch (AMBER Impact)",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "prism.refreshCapabilities",
+        "title": "PRISM: Refresh",
+        "icon": "$(refresh)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "prism-sidebar",
+          "title": "PRISM",
+          "icon": "media/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "prism-sidebar": [
+        {
+          "id": "prism.capabilitiesView",
+          "name": "Capabilities",
+          "icon": "$(list-tree)",
+          "contextualTitle": "PRISM Capabilities"
+        },
+        {
+          "type": "webview",
+          "id": "prism.coherenceView",
+          "name": "Coherence",
+          "icon": "$(shield)"
+        },
+        {
+          "type": "webview",
+          "id": "prism.chatView",
+          "name": "Ask PRISM",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
     "configuration": {
       "title": "PRISM",
       "properties": {
@@ -106,8 +156,28 @@
           "when": "resourceExtname =~ /\\.(ts|tsx|js|jsx|py|go|rs)$/"
         },
         {
-          "command": "prism.healDrift",
+          "command": "prism.openCapability",
           "group": "prism@2"
+        },
+        {
+          "command": "prism.healDrift",
+          "group": "prism@3"
+        },
+        {
+          "command": "prism.openChat",
+          "group": "prism@4"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "prism.refreshCapabilities",
+          "when": "view == prism.capabilitiesView",
+          "group": "navigation"
+        },
+        {
+          "command": "prism.reviewBranch",
+          "when": "view == prism.capabilitiesView",
+          "group": "navigation"
         }
       ]
     }
