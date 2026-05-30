@@ -75,8 +75,42 @@ function config<T>(key: string, defaultVal: T): T {
   return vscode.workspace.getConfiguration("prism").get<T>(key) ?? defaultVal;
 }
 
+// Auto-discover a running prism Studio via the presence file it drops
+// at ~/.prism/studio.json on boot. The Electron Studio writes
+// { port, pid, url, startedAt } there and deletes it on quit, so reading
+// it tells us where to point browser-open commands without the user
+// configuring a port that may change between runs.
+interface StudioPresence { product: "prism"; port: number; pid: number; url: string; startedAt: string }
+
+function readStudioPresence(): StudioPresence | null {
+  try {
+    const home = process.env.HOME ?? process.env.USERPROFILE;
+    if (!home) return null;
+    const raw = fs.readFileSync(path.join(home, ".prism", "studio.json"), "utf8");
+    const parsed = JSON.parse(raw) as StudioPresence;
+    if (!parsed?.port || !parsed?.url) return null;
+    // Stale-pid check: if the recorded PID isn't live, presence is stale.
+    try { process.kill(parsed.pid, 0); } catch { return null; }
+    return parsed;
+  } catch { return null; }
+}
+
+/**
+ * Pick where dashboard links open based on the user's `prism.openIn` pref:
+ *  - "auto" (default): prism Studio if running, otherwise the configured URL
+ *  - "studio":         prism Studio always — fails gracefully to URL if down
+ *  - "url":            never use Studio, always the configured dashboardUrl
+ */
 function dashboardUrl(): string {
-  return config("dashboardUrl", "http://localhost:3000");
+  const mode = config<"auto" | "studio" | "url">("openIn", "auto");
+  const fallback = config("dashboardUrl", "http://localhost:3000");
+  if (mode === "url") return fallback;
+  const studio = readStudioPresence();
+  if (studio) return studio.url;
+  if (mode === "studio") {
+    vscode.window.showWarningMessage("PRISM Studio isn't running — falling back to the configured URL.");
+  }
+  return fallback;
 }
 
 // ─── Data loading ─────────────────────────────────────────────────────────────

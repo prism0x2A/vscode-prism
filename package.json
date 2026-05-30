@@ -65,6 +65,17 @@
           "default": "http://localhost:3000",
           "description": "URL of the PRISM dashboard (prism0x2A). Used to open dashboard links and call APIs."
         },
+        "prism.openIn": {
+          "type": "string",
+          "enum": ["auto", "studio", "url"],
+          "enumDescriptions": [
+            "Auto — prefer the running PRISM Studio app, fall back to dashboardUrl",
+            "Always open in the PRISM Studio desktop app (warn if not running)",
+            "Always open the configured dashboardUrl in the browser"
+          ],
+          "default": "auto",
+          "description": "Where 'Open Dashboard' and capability links should open. Auto-discovers a running PRISM Studio via ~/.prism/studio.json."
+        },
         "prism.showStatusBar": {
           "type": "boolean",
           "default": true,
